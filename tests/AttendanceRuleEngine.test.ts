@@ -1626,4 +1626,197 @@ describe('AttendanceRuleEngine', () => {
       expect(result.workHours).toBeCloseTo(6, 1);
     });
   });
+
+  describe('第五轮边界加固', () => {
+    const nightShift: Shift = {
+      id: 'shift_night',
+      name: '夜班',
+      startTime: '22:00',
+      endTime: '06:00',
+      restStartTime: '00:00',
+      restEndTime: '01:00',
+      lateGraceMinutes: 5,
+      earlyLeaveGraceMinutes: 5,
+      workDays: [1, 2, 3, 4, 5],
+    };
+
+    beforeEach(() => {
+      engine = new AttendanceRuleEngine({
+        shifts: [standardShift, nightShift],
+        leaveTypes: [annualLeaveType, sickLeaveType, compensatoryLeaveType],
+      });
+    });
+
+    it('夜班凌晨请假自动归属到前一天的夜班，无需传两天排班', () => {
+      engine.setLeaveBalances([
+        { employeeId: 'emp_night', leaveTypeCode: 'annual', totalHours: 40, usedHours: 0, frozenHours: 0 },
+      ]);
+
+      const result = engine.applyLeave({
+        employeeId: 'emp_night',
+        leaveTypeCode: 'annual',
+        startTime: '2025-01-07 01:00:00',
+        endTime: '2025-01-07 03:00:00',
+        unit: 'hour',
+        schedules: [
+          { employeeId: 'emp_night', date: '2025-01-06', shiftId: 'shift_night', shift: nightShift },
+        ],
+        autoDeduct: false,
+      });
+
+      expect(result.calculation.success).toBe(true);
+      expect(result.calculation.splitSegments.length).toBeGreaterThan(0);
+      const seg = result.calculation.splitSegments.find(s => s.durationHours > 0);
+      expect(seg).toBeDefined();
+      expect(seg?.date).toBe('2025-01-06');
+      expect(seg?.durationHours).toBe(2);
+      expect(result.calculation.deductedHours).toBe(2);
+    });
+
+    it('批量试算同员工多申请按顺序占用额度，提示合计超额', () => {
+      engine.setLeaveBalances([
+        { employeeId: 'emp_preview', leaveTypeCode: 'annual', totalHours: 16, usedHours: 0, frozenHours: 0 },
+      ]);
+
+      const commonSchedule = {
+        employeeId: 'emp_preview',
+        date: '2025-01-06',
+        shiftId: 'shift_standard',
+        shift: standardShift,
+      };
+
+      const result = engine.applyLeaveBatch({
+        preview: true,
+        requests: [
+          {
+            employeeId: 'emp_preview',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-06 09:00:00',
+            endTime: '2025-01-06 18:00:00',
+            unit: 'day',
+            schedules: [commonSchedule],
+            autoDeduct: false,
+            excludeRequestId: 'r1',
+          },
+          {
+            employeeId: 'emp_preview',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-07 09:00:00',
+            endTime: '2025-01-07 18:00:00',
+            unit: 'day',
+            schedules: [{ ...commonSchedule, date: '2025-01-07' }],
+            autoDeduct: false,
+            excludeRequestId: 'r2',
+          },
+          {
+            employeeId: 'emp_preview',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-08 09:00:00',
+            endTime: '2025-01-08 18:00:00',
+            unit: 'day',
+            schedules: [{ ...commonSchedule, date: '2025-01-08' }],
+            autoDeduct: false,
+            excludeRequestId: 'r3',
+          },
+        ],
+      });
+
+      expect(result.summary.totalCount).toBe(3);
+      expect(result.summary.successCount).toBe(2);
+      expect(result.summary.failedCount).toBe(1);
+      expect(result.summary.insufficientBalanceCount).toBe(1);
+
+      const r1 = result.resultsByEmployee['emp_preview'].find(r => r.requestId === 'r1');
+      const r2 = result.resultsByEmployee['emp_preview'].find(r => r.requestId === 'r2');
+      const r3 = result.resultsByEmployee['emp_preview'].find(r => r.requestId === 'r3');
+
+      expect(r1?.success).toBe(true);
+      expect(r2?.success).toBe(true);
+      expect(r3?.success).toBe(false);
+      expect(r3?.calculation.insufficientBalance).toBe(true);
+      expect(r3?.tips?.some(t => t.includes('超额'))).toBe(true);
+      expect(engine.getLeaveBalance('emp_preview', 'annual')).toBe(16);
+    });
+
+    it('夜班实际工时扣除休息段后与早退分钟对齐', () => {
+      const schedule: WorkSchedule = {
+        employeeId: 'emp_actual',
+        date: '2025-01-06',
+        shiftId: 'shift_night',
+        shift: nightShift,
+      };
+
+      const punch: PunchRecord = {
+        id: 'punch_night',
+        employeeId: 'emp_actual',
+        date: '2025-01-06',
+        checkIn: '22:00',
+        checkOut: '04:00',
+      };
+
+      const result = engine.checkAttendance(schedule, punch, []);
+
+      expect(result.status).toBe('early_leave');
+      expect(result.earlyLeaveMinutes).toBe(115);
+
+      const shiftHours = engine.calculateShiftHours(nightShift);
+      const expectedWorkHours = (shiftHours.workMinutes - result.earlyLeaveMinutes) / 60;
+      expect(result.workHours).toBeCloseTo(expectedWorkHours, 1);
+
+      expect(result.workHours + result.leaveHours + result.nonLeaveRequiredHours * 0 + (result.earlyLeaveMinutes) / 60 + (result.lateMinutes) / 60)
+        .toBeCloseTo(shiftHours.workHours, 1);
+    });
+
+    it('月报异常明细包含每日迟到早退缺卡和部分假剩余', () => {
+      const schedules: WorkSchedule[] = [
+        { employeeId: 'emp_month', date: '2025-01-06', shiftId: 'shift_standard', shift: standardShift },
+        { employeeId: 'emp_month', date: '2025-01-07', shiftId: 'shift_standard', shift: standardShift },
+        { employeeId: 'emp_month', date: '2025-01-08', shiftId: 'shift_standard', shift: standardShift },
+      ];
+      const punches: PunchRecord[] = [
+        { id: 'p1', employeeId: 'emp_month', date: '2025-01-06', checkIn: '09:20', checkOut: '18:00' },
+        { id: 'p2', employeeId: 'emp_month', date: '2025-01-07', checkIn: '09:00', checkOut: '17:00' },
+      ];
+      const leaves: LeaveRequest[] = [
+        {
+          id: 'l1',
+          employeeId: 'emp_month',
+          leaveTypeCode: 'sick',
+          startTime: '2025-01-08 09:00:00',
+          endTime: '2025-01-08 12:00:00',
+          unit: 'hour',
+          status: 'approved',
+          createdAt: '2025-01-01',
+          createdBy: 'admin',
+        },
+      ];
+
+      const summary = engine.generateMonthlySummary({
+        employeeId: 'emp_month',
+        year: 2025,
+        month: 1,
+        schedules,
+        punches,
+        leaves,
+        overtimes: [],
+        leaveTypes: [sickLeaveType, annualLeaveType],
+      });
+
+      expect(summary.dailyAnomalies.length).toBeGreaterThanOrEqual(2);
+
+      const lateDay = summary.dailyAnomalies.find(d => d.date === '2025-01-06');
+      expect(lateDay).toBeDefined();
+      expect(lateDay?.lateMinutes).toBeGreaterThan(0);
+
+      const earlyDay = summary.dailyAnomalies.find(d => d.date === '2025-01-07');
+      expect(earlyDay).toBeDefined();
+      expect(earlyDay?.earlyLeaveMinutes).toBeGreaterThan(0);
+
+      const partialLeaveDay = summary.dailyAnomalies.find(d => d.date === '2025-01-08');
+      expect(partialLeaveDay).toBeDefined();
+      expect(partialLeaveDay?.missingPunch).toBe(true);
+      expect(partialLeaveDay?.leaveHours).toBe(3);
+      expect(partialLeaveDay?.partialLeaveRemainingHours).toBeCloseTo(5, 1);
+    });
+  });
 });

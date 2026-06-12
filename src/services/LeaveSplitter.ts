@@ -14,6 +14,7 @@ import {
   isDateTimeSameDay,
   createDateTime,
   parseDateTime,
+  parseDate,
   diffHours,
   roundHours,
   formatDate,
@@ -162,8 +163,12 @@ export class LeaveSplitter {
         });
     }
 
+    const hasSeriousWarning = warnings.some(
+      (w) => w.includes('未找到对应的假期类型配置')
+    );
+
     return {
-      success: splitSegments.length > 0 && !warnings.some((w) => w.includes('未找到')),
+      success: splitSegments.length > 0 && !hasSeriousWarning,
       deductedHours: totalDeductedHours,
       splitSegments,
       hasConflict,
@@ -177,7 +182,21 @@ export class LeaveSplitter {
   private getLeaveDateRange(startTime: string, endTime: string): string[] {
     const startDate = getDatePart(startTime);
     const endDate = getDatePart(endTime);
-    return generateDateRange(startDate, endDate);
+    const dates: string[] = [];
+
+    const startDt = parseDate(startDate);
+    const previousDay = new Date(startDt);
+    previousDay.setDate(previousDay.getDate() - 1);
+    dates.push(formatDate(previousDay));
+
+    dates.push(...generateDateRange(startDate, endDate));
+
+    const seen = new Set<string>();
+    return dates.filter((d) => {
+      if (seen.has(d)) return false;
+      seen.add(d);
+      return true;
+    });
   }
 
   private calculateDaySegment(
@@ -201,25 +220,16 @@ export class LeaveSplitter {
     let segmentStart = startDt > shiftStart ? startDt : shiftStart;
     let segmentEnd = endDt < shiftEnd ? endDt : shiftEnd;
 
-    const startIsSameDay = isDateTimeSameDay(formatDate(segmentStart), date);
-    const endIsSameDay = isDateTimeSameDay(formatDate(segmentEnd), date);
-
-    const dateStart = parseDateTime(createDateTime(date, '00:00'));
-    const dateEnd = parseDateTime(createDateTime(date, '23:59:59'));
-
-    if (!startIsSameDay) {
-      segmentStart = shiftStart;
-    }
-    if (!endIsSameDay) {
-      segmentEnd = shiftEnd;
-    }
-
-    if (segmentStart < dateStart) {
-      segmentStart = shiftStart > dateStart ? shiftStart : dateStart;
-    }
-    if (segmentEnd > new Date(dateEnd.getTime() + 86400000)) {
-      const nextDateEnd = new Date(dateEnd.getTime() + 86400000);
-      segmentEnd = shiftEnd < nextDateEnd ? shiftEnd : nextDateEnd;
+    if (segmentStart >= segmentEnd) {
+      return {
+        date,
+        startTime: '',
+        endTime: '',
+        durationHours: 0,
+        isWorkDay,
+        isHoliday,
+        shiftId: shift.id,
+      };
     }
 
     const leaveStart = this.formatDateTime(segmentStart);

@@ -8,6 +8,7 @@ import {
   LeaveSummaryItem,
   LeaveTypeCode,
   LeaveType,
+  DailyAnomalyDetail,
 } from '../types';
 import { AttendanceChecker } from './AttendanceChecker';
 import { WorkdayChecker } from './WorkdayChecker';
@@ -88,6 +89,7 @@ export class MonthlySummaryGenerator {
     let businessTripDays = 0;
     let anomalyCount = 0;
     const anomalyDetails: string[] = [];
+    const dailyAnomalies: DailyAnomalyDetail[] = [];
 
     const leaveDetailsMap = new Map<LeaveTypeCode, LeaveSummaryItem>();
     const leaveTypeMap = new Map<LeaveTypeCode, LeaveType>();
@@ -179,6 +181,28 @@ export class MonthlySummaryGenerator {
           }
         }
       }
+
+      const isNonLeaveWorkDay =
+        !schedule.isRestDay && !schedule.isHoliday && schedule.shift;
+      if (isNonLeaveWorkDay && (dayResult.anomalyReasons.length > 0 || dayResult.lateMinutes > 0 || dayResult.earlyLeaveMinutes > 0)) {
+        const missingPunch = !!dayResult.anomalyReasons.find((r) =>
+          r.includes('缺卡') || r.includes('未打卡')
+        );
+        const requiredHours = this.shiftCalculator.calculateShiftHours(schedule.shift!).workHours;
+        dailyAnomalies.push({
+          date,
+          lateMinutes: dayResult.lateMinutes,
+          earlyLeaveMinutes: dayResult.earlyLeaveMinutes,
+          missingPunch,
+          partialLeaveRemainingHours: roundHours(
+            Math.max(0, requiredHours - dayResult.leaveHours - dayResult.workHours)
+          ),
+          actualWorkHours: roundHours(dayResult.workHours),
+          requiredWorkHours: roundHours(requiredHours),
+          leaveHours: roundHours(dayResult.leaveHours),
+          reasons: [...dayResult.anomalyReasons],
+        });
+      }
     }
 
     const uniqueLeaves = new Map<string, LeaveRequest>();
@@ -243,6 +267,7 @@ export class MonthlySummaryGenerator {
       businessTripDays,
       anomalyCount,
       anomalyDetails,
+      dailyAnomalies,
     };
   }
 }

@@ -509,7 +509,6 @@ export class AttendanceChecker {
       return 0;
     }
 
-    const shiftHours = this.shiftCalculator.calculateShiftHours(schedule.shift);
     const punchStartDt = this.createPunchDateTime(schedule, punch.checkIn);
     let punchEndDt = this.createPunchDateTime(schedule, punch.checkOut);
 
@@ -531,7 +530,37 @@ export class AttendanceChecker {
       }
     }
 
-    return Math.min(roundHours(totalWorkMinutes / 60), shiftHours.workHours);
+    if (!schedule.shift) {
+      return roundHours(totalWorkMinutes / 60);
+    }
+
+    const graceLate = schedule.shift.lateGraceMinutes || 0;
+    const graceEarly = schedule.shift.earlyLeaveGraceMinutes || 0;
+    const firstRange = nonLeaveRanges[0];
+    const lastRange = nonLeaveRanges[nonLeaveRanges.length - 1];
+
+    let lateMinutes = 0;
+    if (firstRange) {
+      const requiredStart = parseDateTime(firstRange.startTime);
+      const diff = (punchStartDt.getTime() - requiredStart.getTime()) / (1000 * 60);
+      if (diff > graceLate) {
+        lateMinutes = Math.round(diff - graceLate);
+      }
+    }
+
+    let earlyMinutes = 0;
+    if (lastRange) {
+      const requiredEnd = parseDateTime(lastRange.endTime);
+      const diff = (requiredEnd.getTime() - punchEndDt.getTime()) / (1000 * 60);
+      if (diff > graceEarly) {
+        earlyMinutes = Math.round(diff - graceEarly);
+      }
+    }
+
+    const requiredNonLeaveMinutes = nonLeaveRanges.reduce((s, r) => s + r.minutes, 0);
+    const alignedMinutes = Math.max(0, requiredNonLeaveMinutes - lateMinutes - earlyMinutes);
+
+    return roundHours(Math.min(totalWorkMinutes, alignedMinutes) / 60);
   }
 
   private calculateLateMinutes(

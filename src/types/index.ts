@@ -191,6 +191,18 @@ export interface LeaveConflict {
   date?: string;
 }
 
+export interface DailyAnomalyDetail {
+  date: string;
+  lateMinutes: number;
+  earlyLeaveMinutes: number;
+  missingPunch: boolean;
+  partialLeaveRemainingHours: number;
+  actualWorkHours: number;
+  requiredWorkHours: number;
+  leaveHours: number;
+  reasons: string[];
+}
+
 export interface MonthlyAttendanceSummary {
   employeeId: string;
   year: number;
@@ -212,6 +224,7 @@ export interface MonthlyAttendanceSummary {
   businessTripDays: number;
   anomalyCount: number;
   anomalyDetails: string[];
+  dailyAnomalies: DailyAnomalyDetail[];
 }
 
 export interface LeaveSummaryItem {

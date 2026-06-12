@@ -16,6 +16,7 @@ import {
   ConflictCheckResult,
   LeaveTypeCode,
   LeaveUnit,
+  DailyAnomalyDetail,
 } from '../types';
 
 import { WorkdayChecker } from './WorkdayChecker';
@@ -126,6 +127,7 @@ export interface DepartmentMonthlySummary {
   totalCompensatoryRemainingHours: number;
   totalBusinessTripDays: number;
   totalAnomalyCount: number;
+  employeeAnomalies: Record<string, DailyAnomalyDetail[]>;
 }
 
 export interface BatchMonthlySummaryResult {
@@ -436,20 +438,50 @@ export class AttendanceRuleEngine {
     let conflictCount = 0;
     let insufficientBalanceCount = 0;
 
+    const previewUsedMap = new Map<string, number>();
+    const getPreviewKey = (employeeId: string, leaveTypeCode: string) => `${employeeId}|${leaveTypeCode}`;
+
     for (const req of requests) {
       let result: ApplyLeaveResultWithId;
       try {
         const applyParams = preview
           ? { ...req, autoDeduct: false }
           : req;
-        const single = this.applyLeave(applyParams);
-        const tips = [...single.tips];
+        let single = this.applyLeave(applyParams);
+
         if (preview && single.calculation.success && !single.calculation.hasConflict) {
-          tips.unshift('【试算模式】未扣减额度');
+          const previewKey = getPreviewKey(req.employeeId, req.leaveTypeCode);
+          const alreadyPreviewUsed = previewUsedMap.get(previewKey) || 0;
+          const remainingBalance = this.getLeaveBalance(req.employeeId, req.leaveTypeCode);
+          const effectiveRemaining = remainingBalance - alreadyPreviewUsed;
+          const requestHours = single.calculation.deductedHours;
+
+          if (requestHours > effectiveRemaining) {
+            const calc = { ...single.calculation };
+            calc.insufficientBalance = true;
+            calc.warnings = [
+              ...calc.warnings,
+              `本批次同员工累计试算占用 ${roundHours(alreadyPreviewUsed)} 小时，本次申请 ${requestHours} 小时，合计超过剩余额度 ${roundHours(effectiveRemaining)} 小时`,
+            ];
+            single = {
+              ...single,
+              success: false,
+              calculation: calc,
+              tips: [...single.tips, '【试算模式】同批累计超额，未扣减额度'],
+            };
+          } else {
+            previewUsedMap.set(previewKey, alreadyPreviewUsed + requestHours);
+            const tips = [...single.tips];
+            tips.unshift('【试算模式】未扣减额度');
+            if (alreadyPreviewUsed > 0) {
+              tips.push(`同批已试算占用 ${roundHours(alreadyPreviewUsed)} 小时，本次申请 ${requestHours} 小时，剩余可用 ${roundHours(remainingBalance - alreadyPreviewUsed - requestHours)} 小时`);
+            }
+            single = { ...single, tips };
+          }
         }
+
         result = {
           ...single,
-          tips,
           requestId: req.excludeRequestId,
           employeeId: req.employeeId,
           leaveTypeCode: req.leaveTypeCode,
@@ -535,6 +567,7 @@ export class AttendanceRuleEngine {
       totalCompensatoryRemainingHours: 0,
       totalBusinessTripDays: 0,
       totalAnomalyCount: 0,
+      employeeAnomalies: {},
       _count: 0,
     });
 
@@ -564,6 +597,9 @@ export class AttendanceRuleEngine {
       overall.totalCompensatoryRemainingHours += summary.compensatoryLeaveRemainingHours;
       overall.totalBusinessTripDays += summary.businessTripDays;
       overall.totalAnomalyCount += summary.anomalyCount;
+      if (summary.dailyAnomalies && summary.dailyAnomalies.length > 0) {
+        overall.employeeAnomalies[employee.id] = summary.dailyAnomalies;
+      }
 
       const deptName = employee.department || '未分配';
       if (!byDepartment[deptName]) {
@@ -587,6 +623,9 @@ export class AttendanceRuleEngine {
       dept.totalCompensatoryRemainingHours += summary.compensatoryLeaveRemainingHours;
       dept.totalBusinessTripDays += summary.businessTripDays;
       dept.totalAnomalyCount += summary.anomalyCount;
+      if (summary.dailyAnomalies && summary.dailyAnomalies.length > 0) {
+        dept.employeeAnomalies[employee.id] = summary.dailyAnomalies;
+      }
     }
 
     const cleanByDepartment: Record<string, DepartmentMonthlySummary> = {};
