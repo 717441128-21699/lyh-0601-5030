@@ -5,6 +5,7 @@ import {
   WorkSchedule,
   LeaveRequest,
   OvertimeRecord,
+  LeaveTypeCode,
 } from '../types';
 import { WorkdayChecker } from './WorkdayChecker';
 import { ShiftCalculator } from './ShiftCalculator';
@@ -25,6 +26,12 @@ export interface AttendanceCheckParams {
   overtimes: OvertimeRecord[];
 }
 
+interface LeaveTimeRange {
+  startTime: string;
+  endTime: string;
+  leaveTypeCode: LeaveTypeCode;
+}
+
 export class AttendanceChecker {
   private workdayChecker: WorkdayChecker;
   private shiftCalculator: ShiftCalculator;
@@ -38,7 +45,7 @@ export class AttendanceChecker {
     const { schedule, punch, leaves, overtimes } = params;
     const date = schedule.date;
     const anomalyReasons: string[] = [];
-    let status: AttendanceStatus;
+    let status: AttendanceStatus = 'normal';
     let lateMinutes = 0;
     let earlyLeaveMinutes = 0;
     let workHours = 0;
@@ -55,73 +62,133 @@ export class AttendanceChecker {
       } else {
         status = 'rest_day';
       }
-    } else {
-      status = 'normal';
 
-      const approvedLeaves = leaves.filter(
-        (l) => l.status === 'approved' || l.status === 'pending'
-      );
+      const isNormal = status === 'rest_day' || status === 'overtime';
 
-      if (approvedLeaves.length > 0) {
-        leaveHours = this.calculateLeaveHours(date, approvedLeaves, schedule);
+      return {
+        employeeId: schedule.employeeId,
+        date,
+        status,
+        checkIn: punch?.checkIn,
+        checkOut: punch?.checkOut,
+        shiftStartTime: schedule.shift?.startTime,
+        shiftEndTime: schedule.shift?.endTime,
+        lateMinutes: 0,
+        earlyLeaveMinutes: 0,
+        workHours: roundHours(workHours),
+        overtimeHours: roundHours(overtimeHours),
+        leaveHours: 0,
+        nonLeaveRequiredHours: 0,
+        anomalyReasons,
+        isNormal,
+      };
+    }
+
+    const approvedLeaves = leaves.filter(
+      (l) => l.status === 'approved' || l.status === 'pending'
+    );
+
+    const businessTripLeaves = approvedLeaves.filter(
+      (l) => l.leaveTypeCode === 'business_trip'
+    );
+
+    if (schedule.shift) {
+      const shiftHours = this.shiftCalculator.calculateShiftHours(schedule.shift);
+      const leaveTimeRanges = this.getLeaveTimeRanges(date, approvedLeaves, schedule);
+      leaveHours = roundHours(leaveTimeRanges.reduce((sum, r) => sum + this.calculateRangeHours(r), 0));
+
+      const isFullDayLeave = leaveHours >= shiftHours.workHours;
+
+      if (isFullDayLeave) {
+        if (businessTripLeaves.length > 0) {
+          status = 'business_trip';
+        } else {
+          status = 'leave';
+        }
+        leaveHours = shiftHours.workHours;
+
+        return {
+          employeeId: schedule.employeeId,
+          date,
+          status,
+          checkIn: punch?.checkIn,
+          checkOut: punch?.checkOut,
+          shiftStartTime: schedule.shift.startTime,
+          shiftEndTime: schedule.shift.endTime,
+          lateMinutes: 0,
+          earlyLeaveMinutes: 0,
+          workHours: 0,
+          overtimeHours: 0,
+          leaveHours: roundHours(leaveHours),
+          nonLeaveRequiredHours: 0,
+          anomalyReasons: [],
+          isNormal: true,
+        };
+      }
+
+      const nonLeaveRanges = this.calculateNonLeaveRanges(schedule.shift, date, leaveTimeRanges);
+
+      if (nonLeaveRanges.length > 0) {
+        const requiredWorkMinutes = nonLeaveRanges.reduce((sum, r) => sum + r.minutes, 0);
+
+        if (!punch || (!punch.checkIn && !punch.checkOut)) {
+          status = 'absent';
+          if (leaveHours > 0) {
+            anomalyReasons.push(`请假 ${leaveHours} 小时，剩余 ${roundHours(requiredWorkMinutes / 60)} 小时未打卡`);
+          } else {
+            anomalyReasons.push('未打卡');
+          }
+        } else if (!punch.checkIn || !punch.checkOut) {
+          if (!punch.checkIn) {
+            anomalyReasons.push('缺上班打卡');
+          }
+          if (!punch.checkOut) {
+            anomalyReasons.push('缺下班打卡');
+          }
+
+          if (leaveHours > 0) {
+            anomalyReasons.push(`请假覆盖 ${leaveHours} 小时，非请假时段打卡不完整`);
+          }
+          status = 'absent';
+        } else {
+          const lateResult = this.calculateLateMinutesForNonLeave(punch, schedule, nonLeaveRanges);
+          lateMinutes = lateResult.minutes;
+          if (lateResult.isLate) {
+            status = 'late';
+            anomalyReasons.push(`非请假时段迟到 ${lateMinutes} 分钟`);
+          }
+
+          const earlyResult = this.calculateEarlyLeaveMinutesForNonLeave(punch, schedule, nonLeaveRanges);
+          earlyLeaveMinutes = earlyResult.minutes;
+          if (earlyResult.isEarlyLeave) {
+            if (status !== 'late') {
+              status = 'early_leave';
+            }
+            anomalyReasons.push(`非请假时段早退 ${earlyLeaveMinutes} 分钟`);
+          }
+
+          if (status === 'late' || status === 'early_leave' || lateResult.isLate || earlyResult.isEarlyLeave) {
+            if (leaveHours > 0) {
+              anomalyReasons.push(`请假覆盖 ${leaveHours} 小时，剩余时段需正常出勤`);
+            }
+          }
+
+          workHours = this.calculateActualWorkHoursExcludingLeave(punch, schedule, leaveTimeRanges, date);
+        }
+      } else {
         if (leaveHours > 0) {
           status = 'leave';
         }
       }
-
-      const businessTripLeaves = leaves.filter(
-        (l) => l.leaveTypeCode === 'business_trip' && (l.status === 'approved' || l.status === 'pending')
-      );
-      if (businessTripLeaves.length > 0) {
-        const tripHours = this.calculateLeaveHours(date, businessTripLeaves, schedule);
-        if (tripHours > 0) {
-          status = 'business_trip';
-          leaveHours = tripHours;
-        }
-      }
-
-      if (schedule.shift && punch) {
-        const lateResult = this.calculateLateMinutes(punch, schedule);
-        lateMinutes = lateResult.minutes;
-        if (lateResult.isLate) {
-          status = 'late';
-          anomalyReasons.push(`迟到 ${lateMinutes} 分钟`);
-        }
-
-        const earlyResult = this.calculateEarlyLeaveMinutes(punch, schedule);
-        earlyLeaveMinutes = earlyResult.minutes;
-        if (earlyResult.isEarlyLeave) {
-          status = status === 'late' ? status : 'early_leave';
-          anomalyReasons.push(`早退 ${earlyLeaveMinutes} 分钟`);
-        }
-
-        workHours = this.calculateActualWorkHours(punch, schedule);
-      }
-
-      if (schedule.shift && !punch) {
-        if (leaveHours === 0) {
-          status = 'absent';
-          anomalyReasons.push('未打卡');
-        }
-      }
-
-      if (schedule.shift && punch) {
-        if (!punch.checkIn) {
-          anomalyReasons.push('缺上班打卡');
-          if (status === 'normal') status = 'absent';
-        }
-        if (!punch.checkOut) {
-          anomalyReasons.push('缺下班打卡');
-          if (status === 'normal') status = 'absent';
-        }
-      }
-
-      if (overtimes.length > 0 && schedule.shift && punch) {
-        const dayOvertime = this.calculateOvertimeHours(date, overtimes, schedule.shift);
-        if (dayOvertime > 0) {
-          overtimeHours = dayOvertime;
-          if (status === 'normal') {
-            status = 'overtime';
+    } else {
+      if (approvedLeaves.length > 0) {
+        leaveHours = this.calculateLeaveHours(date, approvedLeaves, schedule);
+        if (leaveHours > 0) {
+          const businessTripLeaves2 = approvedLeaves.filter(l => l.leaveTypeCode === 'business_trip');
+          if (businessTripLeaves2.length > 0) {
+            status = 'business_trip';
+          } else {
+            status = 'leave';
           }
         }
       }
@@ -131,12 +198,26 @@ export class AttendanceChecker {
       anomalyReasons.push('当日无排班');
     }
 
-    const isNormal =
-      status === 'normal' ||
-      status === 'overtime' ||
-      status === 'leave' ||
-      status === 'business_trip' ||
-      status === 'rest_day';
+    if (schedule.shift && !punch && leaveHours === 0 && !schedule.isRestDay && !schedule.isHoliday) {
+      status = 'absent';
+      anomalyReasons.push('未打卡');
+    }
+
+    if (overtimes.length > 0 && schedule.shift) {
+      const dayOvertime = this.calculateOvertimeHours(date, overtimes, schedule.shift);
+      if (dayOvertime > 0) {
+        overtimeHours = dayOvertime;
+        if (status === 'normal') {
+          status = 'overtime';
+        }
+      }
+    }
+
+    const isNormal = ['normal', 'overtime', 'leave', 'business_trip', 'rest_day'].includes(status);
+
+    const nonLeaveRequiredHours = schedule.shift && leaveHours > 0
+      ? roundHours(Math.max(0, this.shiftCalculator.calculateShiftHours(schedule.shift).workHours - leaveHours))
+      : 0;
 
     return {
       employeeId: schedule.employeeId,
@@ -151,9 +232,256 @@ export class AttendanceChecker {
       workHours: roundHours(workHours),
       overtimeHours: roundHours(overtimeHours),
       leaveHours: roundHours(leaveHours),
+      nonLeaveRequiredHours,
       anomalyReasons,
       isNormal,
     };
+  }
+
+  private getLeaveTimeRanges(
+    date: string,
+    leaves: LeaveRequest[],
+    schedule: WorkSchedule
+  ): LeaveTimeRange[] {
+    const ranges: LeaveTimeRange[] = [];
+
+    for (const leave of leaves) {
+      const leaveStartDate = getDatePart(leave.startTime);
+      const leaveEndDate = getDatePart(leave.endTime);
+      if (date < leaveStartDate || date > leaveEndDate) continue;
+
+      if (schedule.shift) {
+        const deduction = this.shiftCalculator.calculateLeaveDeductionHours(
+          schedule.shift,
+          date,
+          leave.startTime,
+          leave.endTime
+        );
+        if (deduction.hours > 0) {
+          ranges.push({
+            startTime: deduction.startTime,
+            endTime: deduction.endTime,
+            leaveTypeCode: leave.leaveTypeCode,
+          });
+        }
+      }
+    }
+
+    return this.mergeOverlappingRanges(ranges);
+  }
+
+  private mergeOverlappingRanges(ranges: LeaveTimeRange[]): LeaveTimeRange[] {
+    if (ranges.length <= 1) return ranges;
+
+    const sorted = [...ranges].sort((a, b) =>
+      parseDateTime(a.startTime).getTime() - parseDateTime(b.startTime).getTime()
+    );
+
+    const merged: LeaveTimeRange[] = [{ ...sorted[0] }];
+
+    for (let i = 1; i < sorted.length; i++) {
+      const last = merged[merged.length - 1];
+      const current = sorted[i];
+
+      if (parseDateTime(current.startTime) <= parseDateTime(last.endTime)) {
+        if (parseDateTime(current.endTime) > parseDateTime(last.endTime)) {
+          last.endTime = current.endTime;
+        }
+      } else {
+        merged.push({ ...current });
+      }
+    }
+
+    return merged;
+  }
+
+  private calculateRangeHours(range: { startTime: string; endTime: string }): number {
+    return diffMinutes(range.startTime, range.endTime) / 60;
+  }
+
+  private calculateNonLeaveRanges(
+    shift: NonNullable<WorkSchedule['shift']>,
+    date: string,
+    leaveRanges: LeaveTimeRange[]
+  ): { startTime: string; endTime: string; minutes: number }[] {
+    const shiftStart = createDateTime(date, shift.startTime);
+    let shiftEnd = createDateTime(date, shift.endTime);
+    if (parseDateTime(shiftEnd) <= parseDateTime(shiftStart)) {
+      const nextDay = new Date(date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      shiftEnd = createDateTime(formatDate(nextDay), shift.endTime);
+    }
+
+    if (leaveRanges.length === 0) {
+      const shiftHours = this.shiftCalculator.calculateShiftHours(shift);
+      return [{
+        startTime: shiftStart,
+        endTime: shiftEnd,
+        minutes: shiftHours.workMinutes,
+      }];
+    }
+
+    const nonLeave: { startTime: string; endTime: string; minutes: number }[] = [];
+    let currentStart = shiftStart;
+
+    const sortedLeaves = [...leaveRanges].sort((a, b) =>
+      parseDateTime(a.startTime).getTime() - parseDateTime(b.startTime).getTime()
+    );
+
+    for (const leave of sortedLeaves) {
+      const leaveStart = parseDateTime(leave.startTime);
+      const leaveEnd = parseDateTime(leave.endTime);
+      const currentStartDt = parseDateTime(currentStart);
+
+      if (currentStartDt < leaveStart) {
+        const gapStart = currentStart;
+        const gapEnd = leave.startTime;
+        const gapMinutes = diffMinutes(gapStart, gapEnd);
+
+        if (shift.restStartTime && shift.restEndTime) {
+          const restStart = createDateTime(date, shift.restStartTime);
+          const restEnd = createDateTime(date, shift.restEndTime);
+          const restOverlap = this.calculateOverlapMinutesGap(gapStart, gapEnd, restStart, restEnd);
+          const netMinutes = Math.max(0, gapMinutes - restOverlap);
+          if (netMinutes > 0) {
+            nonLeave.push({ startTime: gapStart, endTime: gapEnd, minutes: netMinutes });
+          }
+        } else {
+          if (gapMinutes > 0) {
+            nonLeave.push({ startTime: gapStart, endTime: gapEnd, minutes: gapMinutes });
+          }
+        }
+      }
+
+      currentStart = leaveEnd > parseDateTime(currentStart) ? leave.endTime : currentStart;
+    }
+
+    const currentStartDt = parseDateTime(currentStart);
+    const shiftEndDt = parseDateTime(shiftEnd);
+    if (currentStartDt < shiftEndDt) {
+      const gapMinutes = diffMinutes(currentStart, shiftEnd);
+
+      if (shift.restStartTime && shift.restEndTime) {
+        const restStart = createDateTime(date, shift.restStartTime);
+        const restEnd = createDateTime(date, shift.restEndTime);
+        const restOverlap = this.calculateOverlapMinutesGap(currentStart, shiftEnd, restStart, restEnd);
+        const netMinutes = Math.max(0, gapMinutes - restOverlap);
+        if (netMinutes > 0) {
+          nonLeave.push({ startTime: currentStart, endTime: shiftEnd, minutes: netMinutes });
+        }
+      } else {
+        if (gapMinutes > 0) {
+          nonLeave.push({ startTime: currentStart, endTime: shiftEnd, minutes: gapMinutes });
+        }
+      }
+    }
+
+    return nonLeave;
+  }
+
+  private calculateOverlapMinutesGap(
+    range1Start: string,
+    range1End: string,
+    range2Start: string,
+    range2End: string
+  ): number {
+    const r1s = parseDateTime(range1Start).getTime();
+    const r1e = parseDateTime(range1End).getTime();
+    const r2s = parseDateTime(range2Start).getTime();
+    const r2e = parseDateTime(range2End).getTime();
+
+    const overlapStart = Math.max(r1s, r2s);
+    const overlapEnd = Math.min(r1e, r2e);
+
+    if (overlapStart >= overlapEnd) return 0;
+    return Math.round((overlapEnd - overlapStart) / (1000 * 60));
+  }
+
+  private calculateLateMinutesForNonLeave(
+    punch: PunchRecord,
+    schedule: WorkSchedule,
+    nonLeaveRanges: { startTime: string; endTime: string; minutes: number }[]
+  ): { minutes: number; isLate: boolean } {
+    if (!punch.checkIn || !schedule.shift || nonLeaveRanges.length === 0) {
+      return { minutes: 0, isLate: false };
+    }
+
+    const firstNonLeave = nonLeaveRanges[0];
+    const graceMinutes = schedule.shift.lateGraceMinutes || 0;
+    const checkInTime = parseDateTime(createDateTime(schedule.date, punch.checkIn));
+    const requiredStart = parseDateTime(firstNonLeave.startTime);
+
+    let diff = (checkInTime.getTime() - requiredStart.getTime()) / (1000 * 60);
+    if (diff < 0) diff = 0;
+
+    const isLate = diff > graceMinutes;
+    const actualMinutes = isLate ? Math.round(diff - graceMinutes) : 0;
+
+    return { minutes: actualMinutes, isLate };
+  }
+
+  private calculateEarlyLeaveMinutesForNonLeave(
+    punch: PunchRecord,
+    schedule: WorkSchedule,
+    nonLeaveRanges: { startTime: string; endTime: string; minutes: number }[]
+  ): { minutes: number; isEarlyLeave: boolean } {
+    if (!punch.checkOut || !schedule.shift || nonLeaveRanges.length === 0) {
+      return { minutes: 0, isEarlyLeave: false };
+    }
+
+    const lastNonLeave = nonLeaveRanges[nonLeaveRanges.length - 1];
+    const graceMinutes = schedule.shift.earlyLeaveGraceMinutes || 0;
+    const checkOutTime = parseDateTime(createDateTime(schedule.date, punch.checkOut));
+    const requiredEnd = parseDateTime(lastNonLeave.endTime);
+
+    let diff = (requiredEnd.getTime() - checkOutTime.getTime()) / (1000 * 60);
+    if (diff < 0) diff = 0;
+
+    const isEarlyLeave = diff > graceMinutes;
+    const actualMinutes = isEarlyLeave ? Math.round(diff - graceMinutes) : 0;
+
+    return { minutes: actualMinutes, isEarlyLeave };
+  }
+
+  private calculateActualWorkHoursExcludingLeave(
+    punch: PunchRecord,
+    schedule: WorkSchedule,
+    leaveTimeRanges: LeaveTimeRange[],
+    date: string
+  ): number {
+    if (!punch.checkIn || !punch.checkOut || !schedule.shift) {
+      return 0;
+    }
+
+    const shiftHours = this.shiftCalculator.calculateShiftHours(schedule.shift);
+    const punchStart = createDateTime(date, punch.checkIn);
+    let punchEnd = createDateTime(date, punch.checkOut);
+
+    if (parseDateTime(punchEnd) <= parseDateTime(punchStart)) {
+      const nextDay = new Date(date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      punchEnd = createDateTime(formatDate(nextDay), punch.checkOut);
+    }
+
+    let totalWorkMinutes = 0;
+
+    const nonLeaveRanges = this.calculateNonLeaveRanges(schedule.shift, date, leaveTimeRanges);
+
+    for (const range of nonLeaveRanges) {
+      const rangeStart = parseDateTime(range.startTime);
+      const rangeEnd = parseDateTime(range.endTime);
+      const punchStartDt = parseDateTime(punchStart);
+      const punchEndDt = parseDateTime(punchEnd);
+
+      const actualStart = punchStartDt > rangeStart ? punchStartDt : rangeStart;
+      const actualEnd = punchEndDt < rangeEnd ? punchEndDt : rangeEnd;
+
+      if (actualEnd > actualStart) {
+        totalWorkMinutes += (actualEnd.getTime() - actualStart.getTime()) / (1000 * 60);
+      }
+    }
+
+    return Math.min(roundHours(totalWorkMinutes / 60), shiftHours.workHours);
   }
 
   private calculateLateMinutes(
@@ -191,9 +519,6 @@ export class AttendanceChecker {
 
     if (shiftEndMinutes <= timeToMinutes(schedule.shift.startTime)) {
       shiftEndMinutes += 24 * 60;
-      if (checkOutMinutes <= timeToMinutes(schedule.shift.startTime)) {
-        checkOutMinutes + 0;
-      }
     }
 
     let actualCheckOut = checkOutMinutes;
@@ -208,25 +533,6 @@ export class AttendanceChecker {
     const actualMinutes = isEarlyLeave ? diff - graceMinutes : 0;
 
     return { minutes: actualMinutes, isEarlyLeave };
-  }
-
-  private calculateActualWorkHours(
-    punch: PunchRecord,
-    schedule: WorkSchedule
-  ): number {
-    if (!punch.checkIn || !punch.checkOut || !schedule.shift) {
-      return 0;
-    }
-
-    const shiftHours = this.shiftCalculator.calculateShiftHours(schedule.shift);
-    const deduction = this.shiftCalculator.calculateLeaveDeductionHours(
-      schedule.shift,
-      schedule.date,
-      createDateTime(schedule.date, punch.checkIn),
-      createDateTime(schedule.date, punch.checkOut)
-    );
-
-    return Math.min(deduction.hours, shiftHours.workHours);
   }
 
   private calculateLeaveHours(

@@ -28,19 +28,44 @@ export class ConflictChecker {
     const nonWorkDayConflicts = this.checkNonWorkDayConflicts(request);
     conflicts.push(...nonWorkDayConflicts);
 
+    const hasConflict = conflicts.some(
+      (c) => c.type !== 'self_modify' && c.type !== 'excluded_cancelled'
+    );
+
     return {
-      hasConflict: conflicts.length > 0,
+      hasConflict,
       conflicts,
     };
   }
 
   private checkLeaveOverlap(request: ConflictCheckRequest): LeaveConflict[] {
     const conflicts: LeaveConflict[] = [];
-    const { startTime, endTime, existingLeaves, excludeRequestId } = request;
+    const { employeeId, startTime, endTime, existingLeaves, excludeRequestId } = request;
 
     for (const existing of existingLeaves) {
-      if (existing.id === excludeRequestId) continue;
-      if (existing.status === 'rejected' || existing.status === 'cancelled') continue;
+      if (existing.employeeId !== employeeId) continue;
+
+      if (existing.status === 'rejected' || existing.status === 'cancelled') {
+        if (existing.id === excludeRequestId) {
+          conflicts.push({
+            type: 'excluded_cancelled',
+            description: `请假单 ${existing.id} 已${existing.status === 'cancelled' ? '撤销' : '拒绝'}，已排除冲突计算`,
+            conflictingRequestId: existing.id,
+            conflictingEmployeeId: existing.employeeId,
+          });
+        }
+        continue;
+      }
+
+      if (existing.id === excludeRequestId) {
+        conflicts.push({
+          type: 'self_modify',
+          description: `请假单 ${existing.id} 为修改原单，已排除冲突计算`,
+          conflictingRequestId: existing.id,
+          conflictingEmployeeId: existing.employeeId,
+        });
+        continue;
+      }
 
       const overlap = this.calculateTimeOverlap(
         startTime,
@@ -54,6 +79,7 @@ export class ConflictChecker {
           type: 'leave_overlap',
           description: `与请假单 ${existing.id} 存在时间重叠（重叠约 ${overlap.toFixed(1)} 小时）`,
           conflictingRequestId: existing.id,
+          conflictingEmployeeId: existing.employeeId,
         });
       }
     }
@@ -119,6 +145,7 @@ export class ConflictChecker {
     for (const ot of overtimes) {
       if (ot.id === excludeId) continue;
       if (!ot.approved) continue;
+      if (ot.employeeId !== employeeId) continue;
 
       const otStart = `${ot.date} ${ot.startTime}`;
       const otEnd = `${ot.date} ${ot.endTime}`;
@@ -135,6 +162,7 @@ export class ConflictChecker {
           type: 'overtime_overlap',
           description: `与加班记录 ${ot.id} 存在时间重叠（重叠约 ${overlap.toFixed(1)} 小时）`,
           conflictingRequestId: ot.id,
+          conflictingEmployeeId: employeeId,
           date: ot.date,
         });
       }
@@ -145,6 +173,8 @@ export class ConflictChecker {
 
   hasAnyConflict(request: ConflictCheckRequest): boolean {
     const result = this.checkConflicts(request);
-    return result.hasConflict;
+    return result.conflicts.some(
+      (c) => c.type === 'leave_overlap' || c.type === 'overtime_overlap' || c.type === 'non_work_day'
+    );
   }
 }

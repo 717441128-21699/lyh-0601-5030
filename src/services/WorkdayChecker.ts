@@ -52,15 +52,20 @@ export class WorkdayChecker {
   }
 
   isWorkDay(date: string, shiftWorkDays?: number[]): boolean {
-    if (this.isHoliday(date) && !this.isMakeupWorkday(date)) {
-      return false;
-    }
     if (this.isMakeupWorkday(date)) {
       return true;
     }
-    const workDays = shiftWorkDays || [1, 2, 3, 4, 5];
+    if (this.isHoliday(date)) {
+      return false;
+    }
     const dayOfWeek = new Date(date).getDay();
-    return workDays.includes(dayOfWeek);
+    if (this.weekendConfig.days.includes(dayOfWeek)) {
+      return false;
+    }
+    if (shiftWorkDays) {
+      return shiftWorkDays.includes(dayOfWeek);
+    }
+    return true;
   }
 
   isRestDay(date: string, shiftWorkDays?: number[]): boolean {
@@ -74,13 +79,14 @@ export class WorkdayChecker {
     if (this.isHoliday(date)) {
       return 'holiday';
     }
-    if (this.isWeekend(date)) {
+    const dayOfWeek = new Date(date).getDay();
+    if (this.weekendConfig.days.includes(dayOfWeek)) {
       return 'weekend';
     }
-    if (this.isWorkDay(date, shiftWorkDays)) {
-      return 'workday';
+    if (shiftWorkDays) {
+      return shiftWorkDays.includes(dayOfWeek) ? 'workday' : 'weekend';
     }
-    return 'weekend';
+    return 'workday';
   }
 
   countWorkDays(startDate: string, endDate: string, shiftWorkDays?: number[]): number {

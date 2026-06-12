@@ -114,6 +114,7 @@ export interface OvertimeRecord {
   durationHours: number;
   reason?: string;
   convertedToCompensatory: boolean;
+  convertedHours?: number;
   compensatoryHoursUsed?: number;
   approved: boolean;
 }
@@ -164,6 +165,7 @@ export interface AttendanceResult {
   workHours: number;
   overtimeHours: number;
   leaveHours: number;
+  nonLeaveRequiredHours: number;
   anomalyReasons: string[];
   isNormal: boolean;
 }
@@ -182,9 +184,10 @@ export interface ConflictCheckResult {
 }
 
 export interface LeaveConflict {
-  type: 'leave_overlap' | 'overtime_overlap' | 'non_work_day';
+  type: 'leave_overlap' | 'overtime_overlap' | 'non_work_day' | 'self_modify' | 'excluded_cancelled';
   description: string;
   conflictingRequestId?: string;
+  conflictingEmployeeId?: string;
   date?: string;
 }
 

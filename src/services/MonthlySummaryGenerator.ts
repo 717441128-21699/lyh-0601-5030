@@ -93,17 +93,10 @@ export class MonthlySummaryGenerator {
     const leaveTypeMap = new Map<LeaveTypeCode, LeaveType>();
     leaveTypes.forEach((lt) => leaveTypeMap.set(lt.code, lt));
 
-    const dayResults: AttendanceResult[] = [];
-
     for (const date of monthDates) {
-      const schedule = scheduleMap.get(date) || {
-        employeeId,
-        date,
-        shiftId: '',
-        isRestDay: !this.workdayChecker.isWorkDay(date),
-      };
+      const schedule = scheduleMap.get(date);
 
-      const punch = punchMap.get(date);
+      if (!schedule) continue;
 
       if (!schedule.isRestDay && !schedule.isHoliday) {
         totalWorkDays++;
@@ -112,6 +105,8 @@ export class MonthlySummaryGenerator {
           totalWorkHours += shiftHours.workHours;
         }
       }
+
+      const punch = punchMap.get(date);
 
       const dayLeaves = approvedLeaves.filter((l) => {
         const leaveStart = l.startTime.split(' ')[0];
@@ -128,23 +123,25 @@ export class MonthlySummaryGenerator {
         overtimes: dayOvertimes,
       });
 
-      dayResults.push(dayResult);
-
       actualWorkHours += dayResult.workHours;
       overtimeHours += dayResult.overtimeHours;
 
-      if (dayResult.status === 'normal' || dayResult.status === 'overtime') {
-        if (!schedule.isRestDay && !schedule.isHoliday) {
-          actualWorkDays++;
-        }
+      if (
+        (dayResult.status === 'normal' || dayResult.status === 'overtime') &&
+        !schedule.isRestDay &&
+        !schedule.isHoliday &&
+        schedule.shift &&
+        punch
+      ) {
+        actualWorkDays++;
       }
 
-      if (dayResult.status === 'late') {
+      if (dayResult.lateMinutes > 0) {
         lateCount++;
         lateTotalMinutes += dayResult.lateMinutes;
       }
 
-      if (dayResult.status === 'early_leave') {
+      if (dayResult.earlyLeaveMinutes > 0) {
         earlyLeaveCount++;
         earlyLeaveTotalMinutes += dayResult.earlyLeaveMinutes;
       }

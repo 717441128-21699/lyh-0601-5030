@@ -143,7 +143,12 @@ export class LeaveSplitter {
 
     if (hasConflict && request.existingLeaves) {
       request.existingLeaves
-        .filter((l) => l.id !== request.excludeRequestId && l.status !== 'rejected' && l.status !== 'cancelled')
+        .filter((l) =>
+          l.employeeId === request.employeeId &&
+          l.id !== request.excludeRequestId &&
+          l.status !== 'rejected' &&
+          l.status !== 'cancelled'
+        )
         .forEach((existing) => {
           const overlap = this.calculateLeaveOverlap(
             request.startTime,
@@ -274,6 +279,7 @@ export class LeaveSplitter {
     }
 
     for (const existing of request.existingLeaves) {
+      if (existing.employeeId !== request.employeeId) continue;
       if (existing.id === request.excludeRequestId) continue;
       if (existing.status === 'rejected' || existing.status === 'cancelled') continue;
 

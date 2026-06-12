@@ -60,16 +60,19 @@ export class CompensatoryLeaveManager {
 
   getUnconvertedOvertimeHours(employeeId: string): number {
     const records = this.getEmployeeOvertimeRecords(employeeId).filter(
-      (r) => r.approved && !r.convertedToCompensatory
+      (r) => r.approved
     );
-    return roundHours(records.reduce((sum, r) => sum + r.durationHours, 0));
+    return roundHours(records.reduce((sum, r) => {
+      const converted = r.convertedHours || 0;
+      return sum + (r.durationHours - converted);
+    }, 0));
   }
 
   getConvertedOvertimeHours(employeeId: string): number {
     const records = this.getEmployeeOvertimeRecords(employeeId).filter(
-      (r) => r.approved && r.convertedToCompensatory
+      (r) => r.approved
     );
-    return roundHours(records.reduce((sum, r) => sum + r.durationHours, 0));
+    return roundHours(records.reduce((sum, r) => sum + (r.convertedHours || 0), 0));
   }
 
   convertOvertimeToCompensatory(
@@ -98,40 +101,46 @@ export class CompensatoryLeaveManager {
       };
     }
 
-    if (record.convertedToCompensatory) {
+    const alreadyConverted = record.convertedHours || 0;
+    const remainingOvertime = roundHours(record.durationHours - alreadyConverted);
+
+    if (remainingOvertime <= 0) {
       return {
         success: false,
         convertedHours: 0,
         remainingOvertimeHours: 0,
         compensatoryBalance: this.getBalance(record.employeeId),
-        message: '该加班记录已转调休',
+        message: '该加班记录已全部转为调休，无剩余可转时长',
       };
     }
 
-    const convertHours = hours ? roundHours(hours) : record.durationHours;
+    const convertHours = hours ? roundHours(hours) : remainingOvertime;
 
     if (convertHours <= 0) {
       return {
         success: false,
         convertedHours: 0,
-        remainingOvertimeHours: record.durationHours,
+        remainingOvertimeHours: remainingOvertime,
         compensatoryBalance: this.getBalance(record.employeeId),
         message: '转调休时长必须大于0',
       };
     }
 
-    if (convertHours > record.durationHours) {
+    if (convertHours > remainingOvertime) {
       return {
         success: false,
         convertedHours: 0,
-        remainingOvertimeHours: record.durationHours,
+        remainingOvertimeHours: remainingOvertime,
         compensatoryBalance: this.getBalance(record.employeeId),
-        message: `转调休时长不能超过加班时长(${record.durationHours}小时)`,
+        message: `转调休时长不能超过剩余加班时长(${remainingOvertime}小时)`,
       };
     }
 
-    record.convertedToCompensatory = true;
-    record.compensatoryHoursUsed = 0;
+    record.convertedHours = roundHours(alreadyConverted + convertHours);
+    record.convertedToCompensatory = record.convertedHours >= record.durationHours;
+    if (record.convertedToCompensatory && record.compensatoryHoursUsed === undefined) {
+      record.compensatoryHoursUsed = 0;
+    }
 
     this.balanceManager.increaseBalance(
       record.employeeId,
@@ -139,12 +148,16 @@ export class CompensatoryLeaveManager {
       convertHours
     );
 
+    const newRemaining = roundHours(record.durationHours - record.convertedHours);
+
     return {
       success: true,
       convertedHours: convertHours,
-      remainingOvertimeHours: roundHours(record.durationHours - convertHours),
+      remainingOvertimeHours: newRemaining,
       compensatoryBalance: this.getBalance(record.employeeId),
-      message: `成功将 ${convertHours} 小时加班转为调休`,
+      message: newRemaining > 0
+        ? `成功将 ${convertHours} 小时加班转为调休，该记录还剩 ${newRemaining} 小时可继续转`
+        : `成功将 ${convertHours} 小时加班转为调休，该记录已全部转完`,
       updatedRecord: { ...record },
     };
   }
@@ -200,16 +213,18 @@ export class CompensatoryLeaveManager {
   private updateUsedHoursInRecords(employeeId: string, hours: number): void {
     let remaining = hours;
     const records = this.getEmployeeOvertimeRecords(employeeId)
-      .filter((r) => r.convertedToCompensatory)
+      .filter((r) => (r.convertedHours || 0) > 0)
       .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
     for (const record of records) {
       if (remaining <= 0) break;
 
-      const available = record.durationHours - (record.compensatoryHoursUsed || 0);
+      const converted = record.convertedHours || 0;
+      const used = record.compensatoryHoursUsed || 0;
+      const available = converted - used;
       if (available > 0) {
         const useFromThis = Math.min(remaining, available);
-        record.compensatoryHoursUsed = (record.compensatoryHoursUsed || 0) + useFromThis;
+        record.compensatoryHoursUsed = used + useFromThis;
         remaining -= useFromThis;
       }
     }
@@ -255,7 +270,7 @@ export class CompensatoryLeaveManager {
   private rollbackUsedHoursInRecords(employeeId: string, hours: number): void {
     let remaining = hours;
     const records = this.getEmployeeOvertimeRecords(employeeId)
-      .filter((r) => r.convertedToCompensatory && (r.compensatoryHoursUsed || 0) > 0)
+      .filter((r) => (r.compensatoryHoursUsed || 0) > 0)
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
     for (const record of records) {
