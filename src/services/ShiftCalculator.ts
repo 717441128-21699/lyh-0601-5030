@@ -7,6 +7,7 @@ import {
   parseDateTime,
   diffMinutes,
   roundHours,
+  formatDate,
 } from '../utils/dateUtils';
 
 export interface ShiftHoursResult {
@@ -111,8 +112,12 @@ export class ShiftCalculator {
     let overlapMinutes = diffMinutes(actualStart, actualEnd);
 
     if (shift.restStartTime && shift.restEndTime) {
-      const restStart = createDateTime(date, shift.restStartTime);
-      let restEnd = createDateTime(date, shift.restEndTime);
+      const isNightShift = parseDateTime(shiftEnd) > parseDateTime(createDateTime(date, '23:59:59')) &&
+        parseDateTime(shiftStart) >= parseDateTime(createDateTime(date, '12:00:00'));
+
+      const restStart = this.createRestDateTimeShift(date, shift.restStartTime, isNightShift);
+      let restEnd = this.createRestDateTimeShift(date, shift.restEndTime, isNightShift);
+
       if (parseDateTime(restEnd) <= parseDateTime(restStart)) {
         const nextDay = new Date(date);
         nextDay.setDate(nextDay.getDate() + 1);
@@ -200,5 +205,20 @@ export class ShiftCalculator {
       minutes: shiftHours.workMinutes,
       hours: shiftHours.workHours,
     };
+  }
+
+  private createRestDateTimeShift(
+    date: string,
+    restTime: string,
+    isNightShift: boolean
+  ): string {
+    const restDt = createDateTime(date, restTime);
+    const restHour = parseDateTime(restDt).getHours();
+    if (isNightShift && restHour < 12) {
+      const nextDay = new Date(date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      return createDateTime(formatDate(nextDay), restTime);
+    }
+    return restDt;
   }
 }

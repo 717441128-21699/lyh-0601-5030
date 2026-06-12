@@ -32,4 +32,5 @@ export type {
   BatchMonthlySummaryParams,
   DepartmentMonthlySummary,
   BatchMonthlySummaryResult,
+  DepartmentBatchSummaryParams,
 } from './services/AttendanceRuleEngine';

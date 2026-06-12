@@ -30,6 +30,7 @@ interface LeaveTimeRange {
   startTime: string;
   endTime: string;
   leaveTypeCode: LeaveTypeCode;
+  hours: number;
 }
 
 export class AttendanceChecker {
@@ -98,7 +99,7 @@ export class AttendanceChecker {
     if (schedule.shift) {
       const shiftHours = this.shiftCalculator.calculateShiftHours(schedule.shift);
       const leaveTimeRanges = this.getLeaveTimeRanges(date, approvedLeaves, schedule);
-      leaveHours = roundHours(leaveTimeRanges.reduce((sum, r) => sum + this.calculateRangeHours(r), 0));
+      leaveHours = roundHours(leaveTimeRanges.reduce((sum, r) => sum + r.hours, 0));
 
       const isFullDayLeave = leaveHours >= shiftHours.workHours;
 
@@ -269,6 +270,7 @@ export class AttendanceChecker {
             startTime: deduction.startTime,
             endTime: deduction.endTime,
             leaveTypeCode: leave.leaveTypeCode,
+            hours: deduction.hours,
           });
         }
       }
@@ -294,6 +296,7 @@ export class AttendanceChecker {
         if (parseDateTime(current.endTime) > parseDateTime(last.endTime)) {
           last.endTime = current.endTime;
         }
+        last.hours = roundHours(last.hours + current.hours);
       } else {
         merged.push({ ...current });
       }
@@ -313,11 +316,15 @@ export class AttendanceChecker {
   ): { startTime: string; endTime: string; minutes: number }[] {
     const shiftStart = createDateTime(date, shift.startTime);
     let shiftEnd = createDateTime(date, shift.endTime);
-    if (parseDateTime(shiftEnd) <= parseDateTime(shiftStart)) {
+    const isNightShift = parseDateTime(shiftEnd) <= parseDateTime(shiftStart);
+    if (isNightShift) {
       const nextDay = new Date(date);
       nextDay.setDate(nextDay.getDate() + 1);
       shiftEnd = createDateTime(formatDate(nextDay), shift.endTime);
     }
+
+    const restStart = this.createRestDateTime(date, shift.restStartTime, isNightShift);
+    const restEnd = this.createRestDateTime(date, shift.restEndTime, isNightShift);
 
     if (leaveRanges.length === 0) {
       const shiftHours = this.shiftCalculator.calculateShiftHours(shift);
@@ -345,9 +352,7 @@ export class AttendanceChecker {
         const gapEnd = leave.startTime;
         const gapMinutes = diffMinutes(gapStart, gapEnd);
 
-        if (shift.restStartTime && shift.restEndTime) {
-          const restStart = createDateTime(date, shift.restStartTime);
-          const restEnd = createDateTime(date, shift.restEndTime);
+        if (restStart && restEnd) {
           const restOverlap = this.calculateOverlapMinutesGap(gapStart, gapEnd, restStart, restEnd);
           const netMinutes = Math.max(0, gapMinutes - restOverlap);
           if (netMinutes > 0) {
@@ -368,9 +373,7 @@ export class AttendanceChecker {
     if (currentStartDt < shiftEndDt) {
       const gapMinutes = diffMinutes(currentStart, shiftEnd);
 
-      if (shift.restStartTime && shift.restEndTime) {
-        const restStart = createDateTime(date, shift.restStartTime);
-        const restEnd = createDateTime(date, shift.restEndTime);
+      if (restStart && restEnd) {
         const restOverlap = this.calculateOverlapMinutesGap(currentStart, shiftEnd, restStart, restEnd);
         const netMinutes = Math.max(0, gapMinutes - restOverlap);
         if (netMinutes > 0) {
@@ -384,6 +387,22 @@ export class AttendanceChecker {
     }
 
     return nonLeave;
+  }
+
+  private createRestDateTime(
+    date: string,
+    restTime: string | undefined,
+    isNightShift: boolean
+  ): string | undefined {
+    if (!restTime) return undefined;
+    const restDt = createDateTime(date, restTime);
+    const restHour = parseDateTime(restDt).getHours();
+    if (isNightShift && restHour < 12) {
+      const nextDay = new Date(date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      return createDateTime(formatDate(nextDay), restTime);
+    }
+    return restDt;
   }
 
   private calculateOverlapMinutesGap(
@@ -415,7 +434,7 @@ export class AttendanceChecker {
 
     const firstNonLeave = nonLeaveRanges[0];
     const graceMinutes = schedule.shift.lateGraceMinutes || 0;
-    const checkInTime = parseDateTime(createDateTime(schedule.date, punch.checkIn));
+    const checkInTime = this.createPunchDateTime(schedule, punch.checkIn);
     const requiredStart = parseDateTime(firstNonLeave.startTime);
 
     let diff = (checkInTime.getTime() - requiredStart.getTime()) / (1000 * 60);
@@ -438,7 +457,7 @@ export class AttendanceChecker {
 
     const lastNonLeave = nonLeaveRanges[nonLeaveRanges.length - 1];
     const graceMinutes = schedule.shift.earlyLeaveGraceMinutes || 0;
-    const checkOutTime = parseDateTime(createDateTime(schedule.date, punch.checkOut));
+    const checkOutTime = this.createPunchDateTime(schedule, punch.checkOut);
     const requiredEnd = parseDateTime(lastNonLeave.endTime);
 
     let diff = (requiredEnd.getTime() - checkOutTime.getTime()) / (1000 * 60);
@@ -448,6 +467,23 @@ export class AttendanceChecker {
     const actualMinutes = isEarlyLeave ? Math.round(diff - graceMinutes) : 0;
 
     return { minutes: actualMinutes, isEarlyLeave };
+  }
+
+  private createPunchDateTime(schedule: WorkSchedule, punchTime: string): Date {
+    if (!schedule.shift) return parseDateTime(createDateTime(schedule.date, punchTime));
+
+    const shiftStartMinutes = timeToMinutes(schedule.shift.startTime);
+    const shiftEndMinutes = timeToMinutes(schedule.shift.endTime);
+    const punchMinutes = timeToMinutes(punchTime);
+    const isNightShift = shiftEndMinutes <= shiftStartMinutes;
+
+    if (isNightShift && punchMinutes < shiftStartMinutes) {
+      const nextDay = new Date(schedule.date);
+      nextDay.setDate(nextDay.getDate() + 1);
+      return parseDateTime(createDateTime(formatDate(nextDay), punchTime));
+    }
+
+    return parseDateTime(createDateTime(schedule.date, punchTime));
   }
 
   private calculateActualWorkHoursExcludingLeave(
@@ -474,13 +510,11 @@ export class AttendanceChecker {
     }
 
     const shiftHours = this.shiftCalculator.calculateShiftHours(schedule.shift);
-    const punchStart = createDateTime(schedule.date, punch.checkIn);
-    let punchEnd = createDateTime(schedule.date, punch.checkOut);
+    const punchStartDt = this.createPunchDateTime(schedule, punch.checkIn);
+    let punchEndDt = this.createPunchDateTime(schedule, punch.checkOut);
 
-    if (parseDateTime(punchEnd) <= parseDateTime(punchStart)) {
-      const nextDay = new Date(schedule.date);
-      nextDay.setDate(nextDay.getDate() + 1);
-      punchEnd = createDateTime(formatDate(nextDay), punch.checkOut);
+    if (punchEndDt <= punchStartDt) {
+      punchEndDt = new Date(punchEndDt.getTime() + 24 * 60 * 60 * 1000);
     }
 
     let totalWorkMinutes = 0;
@@ -488,8 +522,6 @@ export class AttendanceChecker {
     for (const range of nonLeaveRanges) {
       const rangeStart = parseDateTime(range.startTime);
       const rangeEnd = parseDateTime(range.endTime);
-      const punchStartDt = parseDateTime(punchStart);
-      const punchEndDt = parseDateTime(punchEnd);
 
       const actualStart = punchStartDt > rangeStart ? punchStartDt : rangeStart;
       const actualEnd = punchEndDt < rangeEnd ? punchEndDt : rangeEnd;

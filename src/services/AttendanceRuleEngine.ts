@@ -76,6 +76,7 @@ export interface CancelLeaveResult {
 
 export interface BatchApplyLeaveParams {
   requests: ApplyLeaveParams[];
+  preview?: boolean;
 }
 
 export interface ApplyLeaveResultWithId extends ApplyLeaveResult {
@@ -131,6 +132,18 @@ export interface BatchMonthlySummaryResult {
   summaries: Record<string, MonthlyAttendanceSummary>;
   byDepartment: Record<string, DepartmentMonthlySummary>;
   overallSummary: DepartmentMonthlySummary;
+}
+
+export interface DepartmentBatchSummaryParams {
+  year: number;
+  month: number;
+  employees: Array<{ id: string; name?: string; department?: string }>;
+  schedules: WorkSchedule[];
+  punches: PunchRecord[];
+  leaves: LeaveRequest[];
+  overtimes: OvertimeRecord[];
+  leaveTypes: LeaveType[];
+  compensatoryManager?: CompensatoryLeaveManager;
 }
 
 export class AttendanceRuleEngine {
@@ -413,7 +426,7 @@ export class AttendanceRuleEngine {
   }
 
   applyLeaveBatch(params: BatchApplyLeaveParams): BatchApplyLeaveResult {
-    const { requests } = params;
+    const { requests, preview = false } = params;
     const resultsMap = new Map<string, ApplyLeaveResultWithId[]>();
     const resultsByEmployee: Record<string, ApplyLeaveResultWithId[]> = {};
 
@@ -426,9 +439,17 @@ export class AttendanceRuleEngine {
     for (const req of requests) {
       let result: ApplyLeaveResultWithId;
       try {
-        const single = this.applyLeave(req);
+        const applyParams = preview
+          ? { ...req, autoDeduct: false }
+          : req;
+        const single = this.applyLeave(applyParams);
+        const tips = [...single.tips];
+        if (preview && single.calculation.success && !single.calculation.hasConflict) {
+          tips.unshift('【试算模式】未扣减额度');
+        }
         result = {
           ...single,
+          tips,
           requestId: req.excludeRequestId,
           employeeId: req.employeeId,
           leaveTypeCode: req.leaveTypeCode,
@@ -598,5 +619,68 @@ export class AttendanceRuleEngine {
       byDepartment: cleanByDepartment,
       overallSummary,
     };
+  }
+
+  generateDepartmentMonthlySummaryBatch(params: DepartmentBatchSummaryParams): BatchMonthlySummaryResult {
+    const {
+      year,
+      month,
+      employees,
+      schedules,
+      punches,
+      leaves,
+      overtimes,
+      leaveTypes,
+      compensatoryManager,
+    } = params;
+
+    const schedulesByEmployee = new Map<string, WorkSchedule[]>();
+    const punchesByEmployee = new Map<string, PunchRecord[]>();
+    const leavesByEmployee = new Map<string, LeaveRequest[]>();
+    const overtimesByEmployee = new Map<string, OvertimeRecord[]>();
+
+    for (const s of schedules) {
+      if (!schedulesByEmployee.has(s.employeeId)) {
+        schedulesByEmployee.set(s.employeeId, []);
+      }
+      schedulesByEmployee.get(s.employeeId)!.push(s);
+    }
+    for (const p of punches) {
+      if (!punchesByEmployee.has(p.employeeId)) {
+        punchesByEmployee.set(p.employeeId, []);
+      }
+      punchesByEmployee.get(p.employeeId)!.push(p);
+    }
+    for (const l of leaves) {
+      if (!leavesByEmployee.has(l.employeeId)) {
+        leavesByEmployee.set(l.employeeId, []);
+      }
+      leavesByEmployee.get(l.employeeId)!.push(l);
+    }
+    for (const o of overtimes) {
+      if (!overtimesByEmployee.has(o.employeeId)) {
+        overtimesByEmployee.set(o.employeeId, []);
+      }
+      overtimesByEmployee.get(o.employeeId)!.push(o);
+    }
+
+    const batchParams: BatchMonthlySummaryParams = {
+      items: employees.map((emp) => ({
+        employee: emp,
+        params: {
+          employeeId: emp.id,
+          year,
+          month,
+          schedules: schedulesByEmployee.get(emp.id) || [],
+          punches: punchesByEmployee.get(emp.id) || [],
+          leaves: leavesByEmployee.get(emp.id) || [],
+          overtimes: overtimesByEmployee.get(emp.id) || [],
+          leaveTypes,
+          compensatoryManager,
+        },
+      })),
+    };
+
+    return this.generateMonthlySummaryBatch(batchParams);
   }
 }
