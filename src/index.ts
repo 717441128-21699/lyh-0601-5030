@@ -25,4 +25,11 @@ export type {
   ApplyLeaveResult,
   CancelLeaveParams,
   CancelLeaveResult,
+  BatchApplyLeaveParams,
+  ApplyLeaveResultWithId,
+  BatchApplyLeaveSummary,
+  BatchApplyLeaveResult,
+  BatchMonthlySummaryParams,
+  DepartmentMonthlySummary,
+  BatchMonthlySummaryResult,
 } from './services/AttendanceRuleEngine';

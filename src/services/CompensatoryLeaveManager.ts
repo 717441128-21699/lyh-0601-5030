@@ -4,7 +4,10 @@ import { roundHours } from '../utils/dateUtils';
 
 export interface CompensatoryConversionResult {
   success: boolean;
+  requestedHours: number;
   convertedHours: number;
+  beforeConvertedHours: number;
+  afterConvertedHours: number;
   remainingOvertimeHours: number;
   compensatoryBalance: number;
   message: string;
@@ -77,87 +80,123 @@ export class CompensatoryLeaveManager {
 
   convertOvertimeToCompensatory(
     overtimeRecordId: string,
-    hours?: number
+    hours?: number,
+    minUnitHours: number = 0.5
   ): CompensatoryConversionResult {
     const record = this.overtimeRecords.get(overtimeRecordId);
 
     if (!record) {
       return {
         success: false,
+        requestedHours: hours ?? 0,
         convertedHours: 0,
+        beforeConvertedHours: 0,
+        afterConvertedHours: 0,
         remainingOvertimeHours: 0,
         compensatoryBalance: 0,
         message: '未找到对应的加班记录',
       };
     }
 
+    const beforeConverted = record.convertedHours || 0;
+    const remainingOvertime = roundHours(record.durationHours - beforeConverted);
+    const employeeId = record.employeeId;
+
     if (!record.approved) {
       return {
         success: false,
+        requestedHours: hours ?? 0,
         convertedHours: 0,
-        remainingOvertimeHours: record.durationHours,
-        compensatoryBalance: this.getBalance(record.employeeId),
+        beforeConvertedHours: beforeConverted,
+        afterConvertedHours: beforeConverted,
+        remainingOvertimeHours: remainingOvertime,
+        compensatoryBalance: this.getBalance(employeeId),
         message: '加班记录尚未审批通过，无法转调休',
       };
     }
 
-    const alreadyConverted = record.convertedHours || 0;
-    const remainingOvertime = roundHours(record.durationHours - alreadyConverted);
-
     if (remainingOvertime <= 0) {
       return {
         success: false,
+        requestedHours: hours ?? 0,
         convertedHours: 0,
+        beforeConvertedHours: beforeConverted,
+        afterConvertedHours: beforeConverted,
         remainingOvertimeHours: 0,
-        compensatoryBalance: this.getBalance(record.employeeId),
+        compensatoryBalance: this.getBalance(employeeId),
         message: '该加班记录已全部转为调休，无剩余可转时长',
       };
     }
 
-    const convertHours = hours ? roundHours(hours) : remainingOvertime;
+    const requestedRaw = hours ?? remainingOvertime;
+    const requestedHours = roundHours(requestedRaw);
 
-    if (convertHours <= 0) {
+    if (requestedHours <= 0) {
       return {
         success: false,
+        requestedHours,
         convertedHours: 0,
+        beforeConvertedHours: beforeConverted,
+        afterConvertedHours: beforeConverted,
         remainingOvertimeHours: remainingOvertime,
-        compensatoryBalance: this.getBalance(record.employeeId),
+        compensatoryBalance: this.getBalance(employeeId),
         message: '转调休时长必须大于0',
       };
     }
 
-    if (convertHours > remainingOvertime) {
+    const minUnit = Math.max(0.01, minUnitHours);
+    const ratio = requestedHours / minUnit;
+    if (Math.abs(ratio - Math.round(ratio)) > 0.001) {
       return {
         success: false,
+        requestedHours,
         convertedHours: 0,
+        beforeConvertedHours: beforeConverted,
+        afterConvertedHours: beforeConverted,
         remainingOvertimeHours: remainingOvertime,
-        compensatoryBalance: this.getBalance(record.employeeId),
-        message: `转调休时长不能超过剩余加班时长(${remainingOvertime}小时)`,
+        compensatoryBalance: this.getBalance(employeeId),
+        message: `转调休时长必须是最小单位(${minUnit}小时)的整数倍`,
       };
     }
 
-    record.convertedHours = roundHours(alreadyConverted + convertHours);
+    if (requestedHours > remainingOvertime) {
+      return {
+        success: false,
+        requestedHours,
+        convertedHours: 0,
+        beforeConvertedHours: beforeConverted,
+        afterConvertedHours: beforeConverted,
+        remainingOvertimeHours: remainingOvertime,
+        compensatoryBalance: this.getBalance(employeeId),
+        message: `转调休时长(${requestedHours}小时)超过剩余可转加班时长(${remainingOvertime}小时)`,
+      };
+    }
+
+    record.convertedHours = roundHours(beforeConverted + requestedHours);
     record.convertedToCompensatory = record.convertedHours >= record.durationHours;
     if (record.convertedToCompensatory && record.compensatoryHoursUsed === undefined) {
       record.compensatoryHoursUsed = 0;
     }
 
     this.balanceManager.increaseBalance(
-      record.employeeId,
+      employeeId,
       this.COMPENSATORY_CODE,
-      convertHours
+      requestedHours
     );
 
     const newRemaining = roundHours(record.durationHours - record.convertedHours);
 
     return {
       success: true,
-      convertedHours: convertHours,
+      requestedHours,
+      convertedHours: requestedHours,
+      beforeConvertedHours: beforeConverted,
+      afterConvertedHours: record.convertedHours,
       remainingOvertimeHours: newRemaining,
-      compensatoryBalance: this.getBalance(record.employeeId),
+      compensatoryBalance: this.getBalance(employeeId),
       message: newRemaining > 0
-        ? `成功将 ${convertHours} 小时加班转为调休，该记录还剩 ${newRemaining} 小时可继续转`
-        : `成功将 ${convertHours} 小时加班转为调休，该记录已全部转完`,
+        ? `成功将 ${requestedHours} 小时加班转为调休，该记录还剩 ${newRemaining} 小时可继续转（累计已转 ${record.convertedHours} 小时）`
+        : `成功将 ${requestedHours} 小时加班转为调休，该记录已全部转完（累计 ${record.convertedHours} 小时）`,
       updatedRecord: { ...record },
     };
   }

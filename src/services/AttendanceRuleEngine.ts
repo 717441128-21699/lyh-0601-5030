@@ -27,6 +27,7 @@ import { AttendanceChecker } from './AttendanceChecker';
 import { ConflictChecker } from './ConflictChecker';
 import { MonthlySummaryGenerator } from './MonthlySummaryGenerator';
 import { MonthlySummaryParams } from './MonthlySummaryGenerator';
+import { roundHours } from '../utils/dateUtils';
 import {
   CompensatoryConversionResult,
   CompensatoryUseResult,
@@ -71,6 +72,65 @@ export interface CancelLeaveResult {
   success: boolean;
   rollback?: RollbackResult;
   message: string;
+}
+
+export interface BatchApplyLeaveParams {
+  requests: ApplyLeaveParams[];
+}
+
+export interface ApplyLeaveResultWithId extends ApplyLeaveResult {
+  requestId?: string;
+  employeeId: string;
+  leaveTypeCode: LeaveTypeCode;
+}
+
+export interface BatchApplyLeaveSummary {
+  totalCount: number;
+  successCount: number;
+  failedCount: number;
+  totalDeductedHours: number;
+  conflictCount: number;
+  insufficientBalanceCount: number;
+}
+
+export interface BatchApplyLeaveResult {
+  success: boolean;
+  results: Map<string, ApplyLeaveResultWithId[]>;
+  resultsByEmployee: Record<string, ApplyLeaveResultWithId[]>;
+  summary: BatchApplyLeaveSummary;
+}
+
+export interface BatchMonthlySummaryParams {
+  items: Array<{
+    employee: { id: string; name?: string; department?: string };
+    params: MonthlySummaryParams;
+  }>;
+}
+
+export interface DepartmentMonthlySummary {
+  departmentName: string;
+  employeeCount: number;
+  totalWorkDays: number;
+  totalActualWorkDays: number;
+  totalWorkHours: number;
+  totalActualWorkHours: number;
+  totalLateCount: number;
+  totalLateMinutes: number;
+  totalEarlyLeaveCount: number;
+  totalEarlyLeaveMinutes: number;
+  totalAbsentDays: number;
+  totalLeaveHours: number;
+  totalOvertimeHours: number;
+  totalCompensatoryUsedHours: number;
+  totalCompensatoryRemainingHours: number;
+  totalBusinessTripDays: number;
+  totalAnomalyCount: number;
+}
+
+export interface BatchMonthlySummaryResult {
+  summaries: Record<string, MonthlyAttendanceSummary>;
+  byDepartment: Record<string, DepartmentMonthlySummary>;
+  overallSummary: DepartmentMonthlySummary;
 }
 
 export class AttendanceRuleEngine {
@@ -292,11 +352,13 @@ export class AttendanceRuleEngine {
 
   convertOvertimeToCompensatory(
     overtimeRecordId: string,
-    hours?: number
+    hours?: number,
+    minUnitHours?: number
   ): CompensatoryConversionResult {
     return this.compensatoryLeaveManager.convertOvertimeToCompensatory(
       overtimeRecordId,
-      hours
+      hours,
+      minUnitHours
     );
   }
 
@@ -348,5 +410,193 @@ export class AttendanceRuleEngine {
 
   getCompensatoryLeaveManager(): CompensatoryLeaveManager {
     return this.compensatoryLeaveManager;
+  }
+
+  applyLeaveBatch(params: BatchApplyLeaveParams): BatchApplyLeaveResult {
+    const { requests } = params;
+    const resultsMap = new Map<string, ApplyLeaveResultWithId[]>();
+    const resultsByEmployee: Record<string, ApplyLeaveResultWithId[]> = {};
+
+    let successCount = 0;
+    let failedCount = 0;
+    let totalDeductedHours = 0;
+    let conflictCount = 0;
+    let insufficientBalanceCount = 0;
+
+    for (const req of requests) {
+      let result: ApplyLeaveResultWithId;
+      try {
+        const single = this.applyLeave(req);
+        result = {
+          ...single,
+          requestId: req.excludeRequestId,
+          employeeId: req.employeeId,
+          leaveTypeCode: req.leaveTypeCode,
+        };
+      } catch (err) {
+        result = {
+          success: false,
+          requestId: req.excludeRequestId,
+          employeeId: req.employeeId,
+          leaveTypeCode: req.leaveTypeCode,
+          calculation: {
+            success: false,
+            deductedHours: 0,
+            splitSegments: [],
+            hasConflict: false,
+            insufficientBalance: false,
+            warnings: [],
+            tips: [],
+          },
+          tips: [],
+          warnings: [`处理异常：${err instanceof Error ? err.message : String(err)}`],
+        };
+      }
+
+      if (result.success) {
+        successCount++;
+        if (result.deduction?.success) {
+          totalDeductedHours += result.deduction.deductedHours;
+        }
+      } else {
+        failedCount++;
+      }
+      if (result.calculation.hasConflict) conflictCount++;
+      if (result.calculation.insufficientBalance) insufficientBalanceCount++;
+
+      if (!resultsMap.has(req.employeeId)) {
+        resultsMap.set(req.employeeId, []);
+      }
+      resultsMap.get(req.employeeId)!.push(result);
+
+      if (!resultsByEmployee[req.employeeId]) {
+        resultsByEmployee[req.employeeId] = [];
+      }
+      resultsByEmployee[req.employeeId].push(result);
+    }
+
+    const summary: BatchApplyLeaveSummary = {
+      totalCount: requests.length,
+      successCount,
+      failedCount,
+      totalDeductedHours: roundHours(totalDeductedHours),
+      conflictCount,
+      insufficientBalanceCount,
+    };
+
+    return {
+      success: failedCount === 0,
+      results: resultsMap,
+      resultsByEmployee,
+      summary,
+    };
+  }
+
+  generateMonthlySummaryBatch(params: BatchMonthlySummaryParams): BatchMonthlySummaryResult {
+    const summaries: Record<string, MonthlyAttendanceSummary> = {};
+    const byDepartment: Record<string, DepartmentMonthlySummary & { _count: number }> = {};
+
+    const createEmptyDept = (name: string): DepartmentMonthlySummary & { _count: number } => ({
+      departmentName: name,
+      employeeCount: 0,
+      totalWorkDays: 0,
+      totalActualWorkDays: 0,
+      totalWorkHours: 0,
+      totalActualWorkHours: 0,
+      totalLateCount: 0,
+      totalLateMinutes: 0,
+      totalEarlyLeaveCount: 0,
+      totalEarlyLeaveMinutes: 0,
+      totalAbsentDays: 0,
+      totalLeaveHours: 0,
+      totalOvertimeHours: 0,
+      totalCompensatoryUsedHours: 0,
+      totalCompensatoryRemainingHours: 0,
+      totalBusinessTripDays: 0,
+      totalAnomalyCount: 0,
+      _count: 0,
+    });
+
+    const overall = createEmptyDept('全体');
+
+    for (const item of params.items) {
+      const { employee, params: singleParams } = item;
+      const summary = this.generateMonthlySummary(singleParams);
+      summaries[employee.id] = summary;
+
+      const leaveTotalHours = summary.leaveDetails.reduce((sum, d) => sum + d.totalHours, 0);
+
+      overall.employeeCount++;
+      overall._count++;
+      overall.totalWorkDays += summary.totalWorkDays;
+      overall.totalActualWorkDays += summary.actualWorkDays;
+      overall.totalWorkHours += summary.totalWorkHours;
+      overall.totalActualWorkHours += summary.actualWorkHours;
+      overall.totalLateCount += summary.lateCount;
+      overall.totalLateMinutes += summary.lateTotalMinutes;
+      overall.totalEarlyLeaveCount += summary.earlyLeaveCount;
+      overall.totalEarlyLeaveMinutes += summary.earlyLeaveTotalMinutes;
+      overall.totalAbsentDays += summary.absentDays;
+      overall.totalLeaveHours += leaveTotalHours;
+      overall.totalOvertimeHours += summary.overtimeHours;
+      overall.totalCompensatoryUsedHours += summary.compensatoryLeaveUsedHours;
+      overall.totalCompensatoryRemainingHours += summary.compensatoryLeaveRemainingHours;
+      overall.totalBusinessTripDays += summary.businessTripDays;
+      overall.totalAnomalyCount += summary.anomalyCount;
+
+      const deptName = employee.department || '未分配';
+      if (!byDepartment[deptName]) {
+        byDepartment[deptName] = createEmptyDept(deptName);
+      }
+      const dept = byDepartment[deptName];
+      dept.employeeCount++;
+      dept._count++;
+      dept.totalWorkDays += summary.totalWorkDays;
+      dept.totalActualWorkDays += summary.actualWorkDays;
+      dept.totalWorkHours += summary.totalWorkHours;
+      dept.totalActualWorkHours += summary.actualWorkHours;
+      dept.totalLateCount += summary.lateCount;
+      dept.totalLateMinutes += summary.lateTotalMinutes;
+      dept.totalEarlyLeaveCount += summary.earlyLeaveCount;
+      dept.totalEarlyLeaveMinutes += summary.earlyLeaveTotalMinutes;
+      dept.totalAbsentDays += summary.absentDays;
+      dept.totalLeaveHours += leaveTotalHours;
+      dept.totalOvertimeHours += summary.overtimeHours;
+      dept.totalCompensatoryUsedHours += summary.compensatoryLeaveUsedHours;
+      dept.totalCompensatoryRemainingHours += summary.compensatoryLeaveRemainingHours;
+      dept.totalBusinessTripDays += summary.businessTripDays;
+      dept.totalAnomalyCount += summary.anomalyCount;
+    }
+
+    const cleanByDepartment: Record<string, DepartmentMonthlySummary> = {};
+    for (const [name, dept] of Object.entries(byDepartment)) {
+      const { _count, ...rest } = dept;
+      cleanByDepartment[name] = {
+        ...rest,
+        totalWorkHours: roundHours(rest.totalWorkHours),
+        totalActualWorkHours: roundHours(rest.totalActualWorkHours),
+        totalLeaveHours: roundHours(rest.totalLeaveHours),
+        totalOvertimeHours: roundHours(rest.totalOvertimeHours),
+        totalCompensatoryUsedHours: roundHours(rest.totalCompensatoryUsedHours),
+        totalCompensatoryRemainingHours: roundHours(rest.totalCompensatoryRemainingHours),
+      };
+    }
+
+    const { _count: _, ...overallRest } = overall;
+    const overallSummary: DepartmentMonthlySummary = {
+      ...overallRest,
+      totalWorkHours: roundHours(overallRest.totalWorkHours),
+      totalActualWorkHours: roundHours(overallRest.totalActualWorkHours),
+      totalLeaveHours: roundHours(overallRest.totalLeaveHours),
+      totalOvertimeHours: roundHours(overallRest.totalOvertimeHours),
+      totalCompensatoryUsedHours: roundHours(overallRest.totalCompensatoryUsedHours),
+      totalCompensatoryRemainingHours: roundHours(overallRest.totalCompensatoryRemainingHours),
+    };
+
+    return {
+      summaries,
+      byDepartment: cleanByDepartment,
+      overallSummary,
+    };
   }
 }

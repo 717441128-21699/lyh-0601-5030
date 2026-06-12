@@ -638,7 +638,7 @@ describe('AttendanceRuleEngine', () => {
       engine.convertOvertimeToCompensatory('ot_partial', 5);
       const result = engine.convertOvertimeToCompensatory('ot_partial', 5);
       expect(result.success).toBe(false);
-      expect(result.message).toContain('剩余加班时长');
+      expect(result.message).toContain('超过');
       expect(result.remainingOvertimeHours).toBe(3);
     });
   });
@@ -1055,6 +1055,307 @@ describe('AttendanceRuleEngine', () => {
 
       expect(summary.totalWorkDays).toBe(2);
       expect(summary.actualWorkDays).toBe(1);
+    });
+  });
+
+  describe('批量请假申请', () => {
+    it('按员工分组返回，单人失败不影响其他人', () => {
+      const schedules1: WorkSchedule[] = [
+        { employeeId: 'emp_a', date: '2025-01-06', shiftId: 'shift_standard', shift: standardShift },
+        { employeeId: 'emp_a', date: '2025-01-07', shiftId: 'shift_standard', shift: standardShift },
+      ];
+      const schedules2: WorkSchedule[] = [
+        { employeeId: 'emp_b', date: '2025-01-06', shiftId: 'shift_standard', shift: standardShift },
+      ];
+
+      engine.setLeaveBalances([
+        { employeeId: 'emp_a', leaveTypeCode: 'annual', totalHours: 80, usedHours: 0, frozenHours: 0 },
+        { employeeId: 'emp_b', leaveTypeCode: 'annual', totalHours: 4, usedHours: 0, frozenHours: 0 },
+      ]);
+
+      const batchResult = engine.applyLeaveBatch({
+        requests: [
+          {
+            employeeId: 'emp_a',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-06 09:00:00',
+            endTime: '2025-01-07 18:00:00',
+            unit: 'day',
+            schedules: schedules1,
+            autoDeduct: true,
+          },
+          {
+            employeeId: 'emp_b',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-06 09:00:00',
+            endTime: '2025-01-06 18:00:00',
+            unit: 'day',
+            schedules: schedules2,
+            autoDeduct: true,
+          },
+        ],
+      });
+
+      expect(batchResult.summary.totalCount).toBe(2);
+      expect(batchResult.summary.successCount).toBe(1);
+      expect(batchResult.summary.failedCount).toBe(1);
+      expect(batchResult.summary.insufficientBalanceCount).toBe(1);
+      expect(batchResult.resultsByEmployee['emp_a'].length).toBe(1);
+      expect(batchResult.resultsByEmployee['emp_a'][0].success).toBe(true);
+      expect(batchResult.resultsByEmployee['emp_b'].length).toBe(1);
+      expect(batchResult.resultsByEmployee['emp_b'][0].success).toBe(false);
+      expect(batchResult.success).toBe(false);
+    });
+
+    it('批量请假中不同员工同一时段不互扰', () => {
+      const schedulesA: WorkSchedule[] = [
+        { employeeId: 'emp_a', date: '2025-01-08', shiftId: 'shift_standard', shift: standardShift },
+      ];
+      const schedulesB: WorkSchedule[] = [
+        { employeeId: 'emp_b', date: '2025-01-08', shiftId: 'shift_standard', shift: standardShift },
+      ];
+
+      engine.setLeaveBalances([
+        { employeeId: 'emp_a', leaveTypeCode: 'annual', totalHours: 40, usedHours: 0, frozenHours: 0 },
+        { employeeId: 'emp_b', leaveTypeCode: 'annual', totalHours: 40, usedHours: 0, frozenHours: 0 },
+      ]);
+
+      const existingA = [
+        {
+          id: 'exist_a',
+          employeeId: 'emp_a',
+          leaveTypeCode: 'annual' as const,
+          startTime: '2025-01-08 09:00:00',
+          endTime: '2025-01-08 12:00:00',
+          unit: 'half_day' as const,
+          status: 'approved' as const,
+          createdAt: '2025-01-01',
+          createdBy: 'admin',
+        },
+      ];
+
+      const batchResult = engine.applyLeaveBatch({
+        requests: [
+          {
+            employeeId: 'emp_a',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-08 13:00:00',
+            endTime: '2025-01-08 18:00:00',
+            unit: 'half_day',
+            schedules: schedulesA,
+            existingLeaves: existingA,
+          },
+          {
+            employeeId: 'emp_b',
+            leaveTypeCode: 'annual',
+            startTime: '2025-01-08 09:00:00',
+            endTime: '2025-01-08 18:00:00',
+            unit: 'day',
+            schedules: schedulesB,
+            existingLeaves: existingA,
+          },
+        ],
+      });
+
+      expect(batchResult.summary.failedCount).toBe(0);
+      expect(batchResult.resultsByEmployee['emp_a'][0].calculation.hasConflict).toBe(false);
+      expect(batchResult.resultsByEmployee['emp_b'][0].calculation.hasConflict).toBe(false);
+    });
+  });
+
+  describe('部分假考勤时长对齐', () => {
+    it('上午假接下午出勤：请假+剩余需出勤=班次总工时', () => {
+      const schedule: WorkSchedule = {
+        employeeId: 'emp_001',
+        date: '2025-01-06',
+        shiftId: 'shift_standard',
+        shift: standardShift,
+      };
+
+      const leaves = [
+        {
+          id: 'leave_am',
+          employeeId: 'emp_001',
+          leaveTypeCode: 'sick' as const,
+          startTime: '2025-01-06 09:00:00',
+          endTime: '2025-01-06 13:00:00',
+          unit: 'half_day' as const,
+          status: 'approved' as const,
+          createdAt: '2025-01-01',
+          createdBy: 'admin',
+          deductedHours: 4,
+        },
+      ];
+
+      const punch: PunchRecord = {
+        id: 'punch_1',
+        employeeId: 'emp_001',
+        date: '2025-01-06',
+        checkIn: '13:00',
+        checkOut: '18:00',
+      };
+
+      const result = engine.checkAttendance(schedule, punch, leaves);
+      expect(result.leaveHours + result.nonLeaveRequiredHours).toBeCloseTo(8, 1);
+    });
+
+    it('跨午休：请假时长扣除午休后正确对齐', () => {
+      const schedule: WorkSchedule = {
+        employeeId: 'emp_001',
+        date: '2025-01-06',
+        shiftId: 'shift_standard',
+        shift: standardShift,
+      };
+
+      const leaves = [
+        {
+          id: 'leave_noon',
+          employeeId: 'emp_001',
+          leaveTypeCode: 'sick' as const,
+          startTime: '2025-01-06 11:00:00',
+          endTime: '2025-01-06 14:00:00',
+          unit: 'hour' as const,
+          status: 'approved' as const,
+          createdAt: '2025-01-01',
+          createdBy: 'admin',
+          deductedHours: 2,
+        },
+      ];
+
+      const punch: PunchRecord = {
+        id: 'punch_2',
+        employeeId: 'emp_001',
+        date: '2025-01-06',
+        checkIn: '09:00',
+        checkOut: '18:00',
+      };
+
+      const result = engine.checkAttendance(schedule, punch, leaves);
+      expect(result.leaveHours).toBe(2);
+      expect(result.leaveHours + result.nonLeaveRequiredHours).toBeCloseTo(8, 1);
+    });
+  });
+
+  describe('调休转换边界加固', () => {
+    beforeEach(() => {
+      engine.addOvertimeRecord({
+        id: 'ot_boundary',
+        employeeId: 'emp_001',
+        date: '2025-01-05',
+        startTime: '18:00',
+        endTime: '22:00',
+        durationHours: 4,
+        reason: '周末加班',
+        convertedToCompensatory: false,
+        approved: true,
+      });
+    });
+
+    it('传 0 小时明确失败且不改余额', () => {
+      const beforeBalance = engine.getCompensatoryBalance('emp_001');
+      const result = engine.convertOvertimeToCompensatory('ot_boundary', 0);
+
+      expect(result.success).toBe(false);
+      expect(result.convertedHours).toBe(0);
+      expect(result.message).toContain('必须大于0');
+      expect(engine.getCompensatoryBalance('emp_001')).toBe(beforeBalance);
+      expect(result.beforeConvertedHours).toBe(0);
+      expect(result.afterConvertedHours).toBe(0);
+    });
+
+    it('超过剩余时长明确失败', () => {
+      const beforeBalance = engine.getCompensatoryBalance('emp_001');
+      const result = engine.convertOvertimeToCompensatory('ot_boundary', 10);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('超过');
+      expect(engine.getCompensatoryBalance('emp_001')).toBe(beforeBalance);
+    });
+
+    it('分批转换时返回清晰：本次转多少、还剩多少', () => {
+      const r1 = engine.convertOvertimeToCompensatory('ot_boundary', 1.5, 0.5);
+      expect(r1.success).toBe(true);
+      expect(r1.convertedHours).toBe(1.5);
+      expect(r1.beforeConvertedHours).toBe(0);
+      expect(r1.afterConvertedHours).toBe(1.5);
+      expect(r1.remainingOvertimeHours).toBe(2.5);
+
+      const r2 = engine.convertOvertimeToCompensatory('ot_boundary', 2.5, 0.5);
+      expect(r2.success).toBe(true);
+      expect(r2.beforeConvertedHours).toBe(1.5);
+      expect(r2.afterConvertedHours).toBe(4);
+      expect(r2.remainingOvertimeHours).toBe(0);
+      expect(r2.message).toContain('已全部转完');
+    });
+
+    it('非最小单位整数倍明确失败', () => {
+      const beforeBalance = engine.getCompensatoryBalance('emp_001');
+      const result = engine.convertOvertimeToCompensatory('ot_boundary', 0.3, 0.5);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('最小单位');
+      expect(engine.getCompensatoryBalance('emp_001')).toBe(beforeBalance);
+    });
+  });
+
+  describe('批量月度摘要', () => {
+    it('多员工数据隔离，部门汇总累加', () => {
+      const schedulesA: WorkSchedule[] = [];
+      const punchesA: PunchRecord[] = [];
+      const schedulesB: WorkSchedule[] = [];
+      const punchesB: PunchRecord[] = [];
+
+      for (let day = 6; day <= 7; day++) {
+        const dateStr = `2025-01-${String(day).padStart(2, '0')}`;
+        schedulesA.push({ employeeId: 'emp_a', date: dateStr, shiftId: 'shift_standard', shift: standardShift });
+        punchesA.push({ id: `pa${day}`, employeeId: 'emp_a', date: dateStr, checkIn: '09:00', checkOut: '18:00' });
+
+        schedulesB.push({ employeeId: 'emp_b', date: dateStr, shiftId: 'shift_standard', shift: standardShift });
+        punchesB.push({ id: `pb${day}`, employeeId: 'emp_b', date: dateStr, checkIn: '09:00', checkOut: '18:00' });
+      }
+
+      const batch = engine.generateMonthlySummaryBatch({
+        items: [
+          {
+            employee: { id: 'emp_a', name: '员工A', department: '研发部' },
+            params: {
+              employeeId: 'emp_a',
+              year: 2025,
+              month: 1,
+              schedules: schedulesA,
+              punches: punchesA,
+              leaves: [],
+              overtimes: [],
+              leaveTypes: [annualLeaveType, sickLeaveType, compensatoryLeaveType],
+            },
+          },
+          {
+            employee: { id: 'emp_b', name: '员工B', department: '研发部' },
+            params: {
+              employeeId: 'emp_b',
+              year: 2025,
+              month: 1,
+              schedules: schedulesB,
+              punches: punchesB,
+              leaves: [],
+              overtimes: [],
+              leaveTypes: [annualLeaveType, sickLeaveType, compensatoryLeaveType],
+            },
+          },
+        ],
+      });
+
+      expect(batch.summaries['emp_a']).toBeDefined();
+      expect(batch.summaries['emp_b']).toBeDefined();
+      expect(batch.summaries['emp_a'].employeeId).toBe('emp_a');
+      expect(batch.summaries['emp_b'].employeeId).toBe('emp_b');
+
+      expect(batch.byDepartment['研发部']).toBeDefined();
+      expect(batch.byDepartment['研发部'].employeeCount).toBe(2);
+      expect(batch.byDepartment['研发部'].totalActualWorkDays).toBe(4);
+
+      expect(batch.overallSummary.employeeCount).toBe(2);
+      expect(batch.overallSummary.totalActualWorkDays).toBe(4);
     });
   });
 });
